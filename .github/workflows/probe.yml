@@ -1,0 +1,68 @@
+name: Release probe
+
+# Test only: exercises the release job's "collect assets" and "create draft release" steps
+# against the artifacts of an already finished build run, so they can be iterated on in a minute
+# instead of rebuilding every platform.
+on:
+  push:
+    branches:
+      - release_probe
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: "37729595113"
+      TAG: "9.9.10"
+    steps:
+      - name: "Download builds"
+        # Through the API rather than actions/download-artifact: some jobs upload a zipped folder
+        # and others a single raw file, and this handles both.
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" --paginate \
+            --jq '.artifacts[] | [.id, .name] | @tsv' > artifacts.tsv
+          cat artifacts.tsv
+          while IFS=$'\t' read -r id name; do
+            echo "::group::${name}"
+            gh api "repos/${REPO}/actions/artifacts/${id}/zip" > "dl/${name}.download"
+            mkdir "dl/${name}.d"
+            if unzip -tq "dl/${name}.download" > /dev/null 2>&1; then
+              unzip -q "dl/${name}.download" -d "dl/${name}.d"
+              rm "dl/${name}.download"
+            else
+              mv "dl/${name}.download" "dl/${name}.d/${name}"
+            fi
+            ls -l "dl/${name}.d"
+            echo "::endgroup::"
+          done < artifacts.tsv
+      - name: "Collect release assets"
+        run: |
+          set -euo pipefail
+          mkdir release
+          one() {  # one <glob> <release name>: exactly one build file must match
+            mapfile -t found < <(find dl -type f -name "$1" | sort)
+            if [ "${#found[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one file matching $1, found ${#found[@]}: ${found[*]:-}"
+              exit 1
+            fi
+            cp "${found[0]}" "release/$2"
+          }
+          one '*ProjectRio-Windows.zip'       Project_Rio_Windows.zip
+          one '*ProjectRio-Windows.exe'       Project_Rio_Windows_Installer.exe
+          one '*ProjectRio-macOS-arm64.zip'   Project_Rio_macOS-Apple_silicon.zip
+          one '*ProjectRio-macOS-x86_64.zip'  Project_Rio_macOS-Intel.zip
+          one '*.AppImage'                    Project_Rio_Linux.AppImage
+          one '*.flatpak'                     Project_Rio_SteamOS.flatpak
+          ls -l release
+          file release/*
+      - name: "Create draft release"
+        run: |
+          gh release create "${TAG}" release/* \
+            --repo "${REPO}" --draft --title "${TAG}" --generate-notes
